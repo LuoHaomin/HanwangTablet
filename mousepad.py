@@ -38,8 +38,9 @@ SCALE_MM = 1.0
 
 
 class MouseMapper:
-    def __init__(self, full_screen: bool):
+    def __init__(self, full_screen: bool, rotation: int = 0):
         self.full_screen = full_screen
+        self.rotation = rotation
         display_id = CGMainDisplayID()
         self.screen_w = CGDisplayPixelsWide(display_id)
         self.screen_h = CGDisplayPixelsHigh(display_id)
@@ -63,8 +64,15 @@ class MouseMapper:
         self.right_down = False
 
     def to_screen(self, ev: PenEvent):
-        x = self.off_x + ev.x / PEN_MAX_X * self.area_w
-        y = self.off_y + ev.y / PEN_MAX_Y * self.area_h
+        dx, dy = ev.x, ev.y
+        if self.rotation == 90:
+            dx, dy = PEN_MAX_Y - dy, dx
+        elif self.rotation == 180:
+            dx, dy = PEN_MAX_X - dx, PEN_MAX_Y - dy
+        elif self.rotation == 270:
+            dx, dy = dy, PEN_MAX_X - dx
+        x = self.off_x + dx / PEN_MAX_X * self.area_w
+        y = self.off_y + dy / PEN_MAX_Y * self.area_h
         return x, y
 
     def post(self, kind, x, y, button=0):
@@ -100,6 +108,8 @@ def main():
     ap.add_argument("--serial", help="adb 设备序列号，默认自动检测")
     ap.add_argument("--full-screen", action="store_true",
                     help="笔区铺满整个屏幕（默认按 4:3 居中映射）")
+    ap.add_argument("--rotation", type=int, default=0, choices=[0, 90, 180, 270],
+                    help="设备摆放旋转角（默认 0，竖拿用 90 或 270）")
     args = ap.parse_args()
 
     serial = args.serial or find_device_serial()
@@ -107,7 +117,7 @@ def main():
         print("未发现 adb 设备，请先: adb connect <设备IP>:<端口>", file=sys.stderr)
         sys.exit(1)
 
-    mapper = MouseMapper(args.full_screen)
+    mapper = MouseMapper(args.full_screen, args.rotation)
     mode = "铺满屏幕" if args.full_screen else f"映射区 {mapper.area_w:.0f}x{mapper.area_h:.0f} 居中"
     print(f"设备: {serial} | 屏幕: {mapper.screen_w}x{mapper.screen_h} | {mode}")
     print("笔尖=左键拖动，笔尾=右键。Ctrl+C 退出。")
