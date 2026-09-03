@@ -1,0 +1,19 @@
+[project]
+name = "handwriting-tablet"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "LuoHaomin", email = "luohaomin@mail.ustc.edu.cn" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "pygame>=2.6.1",
+]
+
+[project.scripts]
+handwriting-tablet = "handwriting_tablet:main"
+
+[build-system]
+requires = ["uv_build>=0.12.8,<0.13.0"]
+build-backend = "uv_build"
