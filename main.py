@@ -24,9 +24,9 @@ BG_COLOR = (250, 248, 244)
 TOOLBAR_H = 52
 BASE_WINDOW_H = 842  # width=1123 时的窗口高度，笔宽缩放以此为基准
 
-# 圈选擦除的判定阈值（设备坐标单位）
+# 圈选擦除的判定阈值：闭合缺口须小于圈直径的此比例，且点数足够
 LASSO_MIN_POINTS = 15
-LASSO_CLOSE_DIST = 150
+LASSO_MAX_GAP_RATIO = 0.30
 
 
 def find_device_serial() -> str | None:
@@ -251,6 +251,11 @@ class Whiteboard:
         self.min_mult = min_mult
         self.max_mult = max_mult
         self.curve_name = curve_name
+        # 自定义曲线的控制点（0-1 归一化），可用曲线编辑器拖拽
+        self.custom_points = [(0.0, 0.0), (0.35, 0.35), (0.65, 0.65), (1.0, 1.0)]
+        self.custom_curve = PressureCurve(self.custom_points)
+        self.show_curve_editor = False
+        self.drag_cp: int | None = None
         self.smooth_idx = smooth_idx
         self.filter = SmoothFilter(SMOOTH_LEVELS[smooth_idx][1])
         self.window_w = width
@@ -272,6 +277,9 @@ class Whiteboard:
 
         self.strokes: list[Stroke] = []
         self.current: Stroke | None = None
+        # 操作命令栈：每个操作记录 (操作前笔画表, 操作后笔画表)，对象共享，代价低
+        self.history: list[tuple[list, list]] = []
+        self.h_idx = 0
         self.color_idx = 0
         self.pen_size = pen_size if pen_size in self.SIZES else self.SIZES[1]
         self.erasing = False
@@ -356,7 +364,7 @@ class Whiteboard:
                 # 橡皮轨迹不作为笔画存储，只用于切割
                 self.current = Stroke(0 if erasing else self.color_idx,
                                       self.pen_size, self.min_mult,
-                                      self.max_mult, CURVES[self.curve_name])
+                                      self.max_mult, self._current_curve())
                 self.current.erasing_trace = erasing
             self.current.add(x, y, p)
             if erasing:
@@ -379,6 +387,7 @@ class Whiteboard:
 
     def _finish_stroke(self, stroke: Stroke):
         if getattr(stroke, "erasing_trace", False):
+            before = self._begin_op()
             if self._is_closed_lasso(stroke):
                 removed = self._lasso_erase(stroke)
                 self.status = f"圈选擦除 {removed} 笔"
@@ -386,15 +395,25 @@ class Whiteboard:
                 split, gone = self._cut_erase(stroke)
                 self.status = f"擦除：切割 {split} 笔，删 {gone} 笔"
             self.redraw_all()
+            self._end_op(before)
             return
+        before = self._begin_op()
         self.strokes.append(stroke)
+        self._end_op(before)
 
     def _is_closed_lasso(self, stroke: Stroke) -> bool:
         pts = stroke.points
         if len(pts) < LASSO_MIN_POINTS:
             return False
         (x0, y0, _), (x1, y1, _) = pts[0], pts[-1]
-        return (x0 - x1) ** 2 + (y0 - y1) ** 2 < LASSO_CLOSE_DIST ** 2
+        gap = ((x0 - x1) ** 2 + (y0 - y1) ** 2) ** 0.5
+        # 手绘圈的缺口阈值随圈大小自适应：小圈要求闭合得更紧
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        diameter = max(max(xs) - min(xs), max(ys) - min(ys))
+        if diameter < 50:  # 太小算不上"圈"，按普通擦除处理
+            return False
+        return gap < LASSO_MAX_GAP_RATIO * diameter
 
     def _lasso_erase(self, lasso: Stroke) -> int:
         poly = [(p[0], p[1]) for p in lasso.points]
@@ -455,13 +474,31 @@ class Whiteboard:
         self.strokes = new_strokes
         return split, gone
 
+    def _begin_op(self) -> list:
+        return list(self.strokes)
+
+    def _end_op(self, before: list):
+        self.history = self.history[:self.h_idx]  # 丢弃被撤销分支
+        self.history.append((before, list(self.strokes)))
+        self.h_idx = len(self.history)
+
     def undo(self):
-        if self.strokes:
-            self.strokes.pop()
+        if self.h_idx > 0:
+            self.h_idx -= 1
+            self.strokes = list(self.history[self.h_idx][0])
             self.redraw_all()
             self.status = "已撤销"
         else:
-            self.status = "没有可撤销的笔画"
+            self.status = "没有可撤销的操作"
+
+    def redo(self):
+        if self.h_idx < len(self.history):
+            self.strokes = list(self.history[self.h_idx][1])
+            self.h_idx += 1
+            self.redraw_all()
+            self.status = "已重做"
+        else:
+            self.status = "没有可重做的操作"
 
     def save(self):
         path = f"note-{time.strftime('%Y%m%d-%H%M%S')}.png"
@@ -490,6 +527,7 @@ class Whiteboard:
                           ("保存", self.save),
                           ("旋转", self._cycle_rotation),
                           ("曲线", self._cycle_curve),
+                          ("曲线编辑", self._toggle_curve_editor),
                           (f"平滑:{SMOOTH_LEVELS[self.smooth_idx][0]}",
                            self._cycle_smooth)):
             r = pygame.Rect(x, y - 16, 58, 32)
@@ -523,10 +561,22 @@ class Whiteboard:
         self._resize_canvas(self.window_w, self.window_h)
         self.status = f"旋转 {self.rotation}°"
 
+    def _current_curve(self) -> PressureCurve:
+        if self.curve_name == "自定义":
+            return self.custom_curve
+        return CURVES[self.curve_name]
+
     def _cycle_curve(self):
-        names = list(CURVES)
+        names = list(CURVES) + ["自定义"]
         self.curve_name = names[(names.index(self.curve_name) + 1) % len(names)]
+        if self.curve_name == "自定义":
+            self.show_curve_editor = True
         self.status = f"曲线: {self.curve_name}"
+
+    def _toggle_curve_editor(self):
+        self.show_curve_editor = not self.show_curve_editor
+        if self.show_curve_editor:
+            self.curve_name = "自定义"
 
     def _cycle_smooth(self):
         self.smooth_idx = (self.smooth_idx + 1) % len(SMOOTH_LEVELS)
@@ -534,8 +584,80 @@ class Whiteboard:
         self.filter = SmoothFilter(alpha)
         self.status = f"平滑: {name}"
 
+    def _curve_panel(self) -> pygame.Rect:
+        return pygame.Rect(self.window_w - 330, 36, 312, 232)
+
+    def _cp_to_px(self, i) -> tuple[float, float]:
+        r = self._curve_panel()
+        px, py = self.custom_points[i]
+        return r.x + 12 + px * (r.w - 24), r.y + r.h - 30 - py * (r.h - 50)
+
+    def _px_to_cp(self, pos) -> tuple[float, float]:
+        r = self._curve_panel()
+        x = (pos[0] - r.x - 12) / (r.w - 24)
+        y = (r.y + r.h - 30 - pos[1]) / (r.h - 50)
+        return min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
+
+    def _curve_editor_mousedown(self, pos) -> bool:
+        r = self._curve_panel()
+        if not r.collidepoint(pos):
+            return False
+        for i in range(len(self.custom_points)):
+            cx, cy = self._cp_to_px(i)
+            if (pos[0] - cx) ** 2 + (pos[1] - cy) ** 2 < 12 ** 2:
+                self.drag_cp = i
+                return True
+        self.drag_cp = None  # 点到面板空白：结束拖拽
+        return True
+
+    def _curve_editor_drag(self, pos):
+        if self.drag_cp is None:
+            return
+        x, y = self._px_to_cp(pos)
+        i = self.drag_cp
+        n = len(self.custom_points)
+        if i == 0:
+            x = 0.0
+        elif i == n - 1:
+            x = 1.0
+        else:
+            # 保持控制点 x 单调递增，PCHIP 才是函数
+            x = min(max(x, self.custom_points[i - 1][0] + 0.03),
+                    self.custom_points[i + 1][0] - 0.03)
+        self.custom_points[i] = (x, y)
+        self.custom_curve = PressureCurve(self.custom_points)
+
+    def draw_curve_editor(self):
+        r = self._curve_panel()
+        pygame.draw.rect(self.screen, (255, 255, 255), r, border_radius=8)
+        pygame.draw.rect(self.screen, (160, 160, 160), r, 2, border_radius=8)
+        t = self.small_font.render("自定义压感曲线（拖动控制点，U 关闭）",
+                                   True, (90, 90, 90))
+        self.screen.blit(t, (r.x + 12, r.y + 8))
+        # 网格与曲线
+        for gx in range(5):
+            x = r.x + 12 + gx * (r.w - 24) / 4
+            pygame.draw.line(self.screen, (230, 230, 230), (x, r.y + 34),
+                             (x, r.y + r.h - 30))
+        pts = []
+        for i in range(61):
+            p = i / 60
+            v = self.custom_curve(p)
+            pts.append((r.x + 12 + p * (r.w - 24),
+                        r.y + r.h - 30 - v * (r.h - 50)))
+        pygame.draw.lines(self.screen, (200, 60, 60), False, pts, 2)
+        for i, (cx, cy) in enumerate(self._cp_to_px(i) for i in
+                                     range(len(self.custom_points))):
+            color = (220, 120, 40) if i == self.drag_cp else (60, 60, 60)
+            pygame.draw.circle(self.screen, color, (cx, cy), 6)
+            pygame.draw.circle(self.screen, (255, 255, 255), (cx, cy), 3)
+
     def _clear(self):
+        if not self.strokes:
+            return
+        before = self._begin_op()
         self.strokes.clear()
+        self._end_op(before)
         self.redraw_all()
         self.status = "已清空"
 
@@ -587,11 +709,22 @@ class Whiteboard:
                     self.window_w, self.window_h = e.w, e.h
                     self._resize_canvas(e.w, e.h)
                 if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
-                    if e.pos[1] >= self.window_h - TOOLBAR_H:
+                    if self.show_curve_editor and \
+                            self._curve_editor_mousedown(e.pos):
+                        pass  # 曲线编辑器优先
+                    elif e.pos[1] >= self.window_h - TOOLBAR_H:
                         self.handle_click(e.pos)
+                if e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+                    self.drag_cp = None
+                if e.type == pygame.MOUSEMOTION and self.drag_cp is not None:
+                    self._curve_editor_drag(e.pos)
                 if e.type == pygame.KEYDOWN:
-                    if e.key == pygame.K_z:
+                    if e.key == pygame.K_z and e.mod & pygame.KMOD_SHIFT:
+                        self.redo()
+                    elif e.key == pygame.K_z:
                         self.undo()
+                    elif e.key == pygame.K_u:
+                        self.show_curve_editor = not self.show_curve_editor
                     elif e.key == pygame.K_c:
                         self._clear()
                     elif e.key == pygame.K_s:
@@ -635,6 +768,8 @@ class Whiteboard:
                    f"{self.min_mult:.2f}-{self.max_mult:.2f}x | {self.status}")
             self.screen.blit(self.font.render(hud, True, (120, 120, 120)), (10, 8))
             self.draw_toolbar()
+            if self.show_curve_editor:
+                self.draw_curve_editor()
             pygame.display.flip()
             clock.tick(120)
 
@@ -652,7 +787,7 @@ def main():
                     help="最轻压感时笔宽倍率（默认 0.2）")
     ap.add_argument("--max-mult", type=float, default=2.0,
                     help="最重压感时笔宽倍率（默认 2.0）")
-    ap.add_argument("--curve", default="适中", choices=list(CURVES),
+    ap.add_argument("--curve", default="适中", choices=list(CURVES) + ["自定义"],
                     help="压感曲线预设（默认 适中）")
     ap.add_argument("--smooth", default="轻", choices=[n for n, _ in SMOOTH_LEVELS],
                     help="笔迹平滑级别（默认 轻）")
