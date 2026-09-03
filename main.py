@@ -188,6 +188,8 @@ class Whiteboard:
                                if g == gamma), 0)
         self.window_w = width
         self.window_h = round(width * PEN_MAX_Y / PEN_MAX_X)
+        if rotation in (90, 270):  # 竖拿时窗口用竖向比例
+            self.window_w, self.window_h = self.window_h, self.window_w
 
         pygame.init()
         pygame.display.set_caption("汉王手写板 — 笔尾即橡皮 | Z撤销 C清空 S保存")
@@ -232,8 +234,13 @@ class Whiteboard:
 
     def map_point(self, dx: int, dy: int) -> tuple[float, float]:
         rx, ry = self.rotate(dx, dy)
-        return (rx / PEN_MAX_X * self.canvas_w,
-                ry / PEN_MAX_Y * self.canvas_h)
+        # 旋转 90/270 后坐标轴对调，分母也要跟着换，否则映射超界
+        if self.rotation in (90, 270):
+            max_x, max_y = PEN_MAX_Y, PEN_MAX_X
+        else:
+            max_x, max_y = PEN_MAX_X, PEN_MAX_Y
+        return (rx / max_x * self.canvas_w,
+                ry / max_y * self.canvas_h)
 
     def _pressure_width(self, stroke, pressure) -> float:
         """压感 → 宽度倍率：归一化压力过 gamma 曲线后线性映射到 [min_mult, max_mult]。"""
@@ -382,8 +389,14 @@ class Whiteboard:
         self.status = "橡皮擦" if self.erasing else "画笔"
 
     def _cycle_rotation(self):
+        old = self.rotation
         self.rotation = (self.rotation + 90) % 360
-        self.redraw_all()
+        # 横竖切换时把窗口转成对应纵横比，画布与可视区一致
+        if old % 180 != self.rotation % 180:
+            self.window_w, self.window_h = self.window_h, self.window_w
+            pygame.display.set_mode((self.window_w, self.window_h),
+                                    pygame.RESIZABLE)
+        self._resize_canvas(self.window_w, self.window_h)
         self.status = f"旋转 {self.rotation}°"
 
     def _clear(self):
@@ -451,9 +464,7 @@ class Whiteboard:
                     elif e.key == pygame.K_e:
                         self._toggle_eraser()
                     elif e.key == pygame.K_r:
-                        self.rotation = (self.rotation + 90) % 360
-                        self.redraw_all()
-                        self.status = f"旋转 {self.rotation}°"
+                        self._cycle_rotation()
                     elif e.key == pygame.K_p:
                         self.curve_idx = (self.curve_idx + 1) % len(CURVE_PRESETS)
                         self.gamma = CURVE_PRESETS[self.curve_idx][1]
