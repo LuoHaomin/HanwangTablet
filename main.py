@@ -24,6 +24,10 @@ BG_COLOR = (250, 248, 244)
 TOOLBAR_H = 52
 BASE_WINDOW_H = 842  # width=1123 时的窗口高度，笔宽缩放以此为基准
 
+# 圈选擦除的判定阈值（设备坐标单位）
+LASSO_MIN_POINTS = 15
+LASSO_CLOSE_DIST = 150
+
 
 def find_device_serial() -> str | None:
     out = subprocess.run(
@@ -128,32 +132,74 @@ class PenReader(threading.Thread):
         self.stop_flag.set()
 
 
-class Stroke:
-    """一笔。点存设备坐标（0-1872/0-1404），窗口缩放后重绘不失真。"""
+class PressureCurve:
+    """PCHIP 单调三次插值压感曲线（控制点 + Fritsch-Carlson 切线）。
 
-    __slots__ = ("erasing", "color_idx", "pen_size",
-                 "min_mult", "max_mult", "gamma", "points")
+    保证单调不过冲：输入输出都在 0-1，适合压感映射。
+    """
 
-    def __init__(self, erasing: bool, color_idx: int, pen_size: float,
-                 min_mult: float, max_mult: float, gamma: float):
-        self.erasing = erasing
-        self.color_idx = color_idx
-        self.pen_size = pen_size
-        self.min_mult = min_mult
-        self.max_mult = max_mult
-        self.gamma = gamma
-        self.points: list[tuple[int, int, int]] = []  # (dev_x, dev_y, pressure)
+    def __init__(self, control_points: list[tuple[float, float]]):
+        self.xs = [p[0] for p in control_points]
+        self.ys = [p[1] for p in control_points]
+        self.ms = self._tangents()
 
-    def add(self, x, y, pressure):
-        self.points.append((x, y, pressure))
+    def _tangents(self):
+        xs, ys = self.xs, self.ys
+        n = len(xs)
+        d = [(ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]) for i in range(n - 1)]
+        m = [0.0] * n
+        m[0] = d[0]
+        m[-1] = d[-1]
+        for i in range(1, n - 1):
+            if d[i - 1] * d[i] <= 0:
+                m[i] = 0.0
+            else:
+                m[i] = 2.0 / (1.0 / d[i - 1] + 1.0 / d[i])  # 调和平均
+        return m
+
+    def __call__(self, p: float) -> float:
+        p = min(max(p, 0.0), 1.0)
+        xs, ys, m = self.xs, self.ys, self.ms
+        i = 0
+        while i < len(xs) - 2 and p > xs[i + 1]:
+            i += 1
+        h = xs[i + 1] - xs[i]
+        t = (p - xs[i]) / h
+        t2, t3 = t * t, t * t * t
+        return (2 * t3 - 3 * t2 + 1) * ys[i] + (t3 - 2 * t2 + t) * h * m[i] \
+            + (-2 * t3 + 3 * t2) * ys[i + 1] + (t3 - t2) * h * m[i + 1]
 
 
-# 压感曲线预设: (名称, gamma)。gamma<1 轻压即粗，>1 需要重压才变粗。
-CURVE_PRESETS = [("线性", 1.0), ("轻快", 0.6), ("硬笔", 1.6)]
+# 压感曲线预设：轻压输出高 = 柔软，重压才出粗笔 = 硬笔
+CURVES = {
+    "柔软": PressureCurve([(0, 0.12), (0.25, 0.5), (0.55, 0.8), (1, 1)]),
+    "适中": PressureCurve([(0, 0.0), (0.5, 0.5), (1, 1)]),
+    "硬笔": PressureCurve([(0, 0.0), (0.45, 0.18), (0.8, 0.5), (1, 1)]),
+}
 
-# 圈选擦除的判定阈值（设备坐标单位）
-LASSO_MIN_POINTS = 15
-LASSO_CLOSE_DIST = 150
+# 平滑级别: 显示名 -> EMA 系数（越小越平滑、延迟越大）
+SMOOTH_LEVELS = [("关", 1.0), ("轻", 0.65), ("中", 0.40), ("强", 0.22)]
+
+
+class SmoothFilter:
+    """一阶指数平滑（EMA），对 x/y/pressure 同步滤波。"""
+
+    def __init__(self, alpha: float):
+        self.alpha = alpha
+        self.reset()
+
+    def reset(self):
+        self.fx = self.fy = self.fp = None
+
+    def apply(self, x, y, pressure):
+        if self.fx is None or self.alpha >= 1.0:
+            self.fx, self.fy, self.fp = float(x), float(y), float(pressure)
+            return x, y, pressure
+        a = self.alpha
+        self.fx += a * (x - self.fx)
+        self.fy += a * (y - self.fy)
+        self.fp += a * (pressure - self.fp)
+        return round(self.fx), round(self.fy), round(self.fp)
 
 
 def point_in_polygon(px, py, poly) -> bool:
@@ -172,27 +218,48 @@ def point_in_polygon(px, py, poly) -> bool:
     return inside
 
 
+class Stroke:
+    """一笔。点存设备坐标（0-1872/0-1404），窗口缩放后重绘不失真。"""
+
+    __slots__ = ("color_idx", "pen_size", "min_mult", "max_mult",
+                 "curve", "points", "erasing_trace")
+
+    def __init__(self, color_idx: int, pen_size: float, min_mult: float,
+                 max_mult: float, curve: PressureCurve):
+        self.color_idx = color_idx
+        self.pen_size = pen_size
+        self.min_mult = min_mult
+        self.max_mult = max_mult
+        self.curve = curve
+        self.erasing_trace = False
+        self.points: list[tuple[int, int, int]] = []  # (dev_x, dev_y, pressure)
+
+    def add(self, x, y, pressure):
+        self.points.append((x, y, pressure))
+
+
 class Whiteboard:
     COLORS = [(30, 30, 34), (200, 40, 40), (30, 90, 200), (20, 120, 60)]
     SIZES = [3.0, 6.0, 10.0, 16.0]
 
     def __init__(self, width: int, min_pressure: int, pen_size: float,
                  rotation: int = 0, min_mult: float = 0.2,
-                 max_mult: float = 2.0, gamma: float = 1.0):
+                 max_mult: float = 2.0, curve_name: str = "适中",
+                 smooth_idx: int = 1):
         self.min_pressure = min_pressure
         self.rotation = rotation
         self.min_mult = min_mult
         self.max_mult = max_mult
-        self.gamma = gamma
-        self.curve_idx = next((i for i, (_, g) in enumerate(CURVE_PRESETS)
-                               if g == gamma), 0)
+        self.curve_name = curve_name
+        self.smooth_idx = smooth_idx
+        self.filter = SmoothFilter(SMOOTH_LEVELS[smooth_idx][1])
         self.window_w = width
         self.window_h = round(width * PEN_MAX_Y / PEN_MAX_X)
         if rotation in (90, 270):  # 竖拿时窗口用竖向比例
             self.window_w, self.window_h = self.window_h, self.window_w
 
         pygame.init()
-        pygame.display.set_caption("汉王手写板 — 笔尾即橡皮 | Z撤销 C清空 S保存")
+        pygame.display.set_caption("汉王手写板 — 笔尾即橡皮/画圈圈选删除 | Z撤销 C清空 S保存")
         self.screen = pygame.display.set_mode(
             (self.window_w, self.window_h), pygame.RESIZABLE
         )
@@ -243,34 +310,25 @@ class Whiteboard:
                 ry / max_y * self.canvas_h)
 
     def _pressure_width(self, stroke, pressure) -> float:
-        """压感 → 宽度倍率：归一化压力过 gamma 曲线后线性映射到 [min_mult, max_mult]。"""
+        """压感 → 宽度倍率：归一化压力过 PCHIP 曲线后映射到 [min_mult, max_mult]。"""
         p = (pressure - self.min_pressure) / (PEN_MAX_PRESSURE - self.min_pressure)
-        p = min(max(p, 0.0), 1.0) ** stroke.gamma
-        return stroke.min_mult + (stroke.max_mult - stroke.min_mult) * p
+        f = stroke.curve(min(max(p, 0.0), 1.0))
+        return stroke.min_mult + (stroke.max_mult - stroke.min_mult) * f
 
     def _seg(self, pt_a, pt_b, stroke):
         """把一条线段画到 canvas。pt 为 (dev_x, dev_y, pressure)。"""
         scale = self.canvas_h / BASE_WINDOW_H
-        if stroke.erasing:
-            color = BG_COLOR
-            width = 40 * scale
-            wa = wb = width
-        else:
-            color = self.COLORS[stroke.color_idx]
-            base = stroke.pen_size * scale
-            wa = max(base * self._pressure_width(stroke, pt_a[2]), 1)
-            wb = max(base * self._pressure_width(stroke, pt_b[2]), 1)
-            width = (wa + wb) / 2
+        color = self.COLORS[stroke.color_idx]
+        base = stroke.pen_size * scale
+        wa = max(base * self._pressure_width(stroke, pt_a[2]), 1)
+        wb = max(base * self._pressure_width(stroke, pt_b[2]), 1)
         ax, ay = self.map_point(*pt_a[:2])
         bx, by = self.map_point(*pt_b[:2])
-        if stroke.erasing:
-            pygame.draw.circle(self.canvas, color, (bx, by), width / 2)
-        else:
-            pygame.draw.line(self.canvas, color, (ax, ay), (bx, by),
-                             max(round(width), 1))
-            # 宽度渐变时用圆补两端，避免锯齿断裂
-            pygame.draw.circle(self.canvas, color, (ax, ay), wa / 2)
-            pygame.draw.circle(self.canvas, color, (bx, by), wb / 2)
+        pygame.draw.line(self.canvas, color, (ax, ay), (bx, by),
+                         max(round((wa + wb) / 2), 1))
+        # 宽度渐变时用圆补两端，避免锯齿断裂
+        pygame.draw.circle(self.canvas, color, (ax, ay), wa / 2)
+        pygame.draw.circle(self.canvas, color, (bx, by), wb / 2)
 
     def redraw_all(self):
         self.canvas.fill(BG_COLOR)
@@ -280,36 +338,55 @@ class Whiteboard:
             if s.points:
                 self._seg(s.points[0], s.points[0], s)
 
+    def _erase_dot(self, pt):
+        """橡皮拖动时的实时视觉反馈（画底色圆）。"""
+        scale = self.canvas_h / BASE_WINDOW_H
+        x, y = self.map_point(pt[0], pt[1])
+        pygame.draw.circle(self.canvas, BG_COLOR, (x, y), 20 * scale)
+
     # ---- 笔事件 ----
 
     def handle_pen(self, ev: PenEvent):
         self.show_pressure = ev.pressure
         if ev.down:
             self.pen_down = True
+            x, y, p = self.filter.apply(ev.x, ev.y, ev.pressure)
             erasing = self.erasing or ev.rubber
             if self.current is None:
-                self.current = Stroke(erasing, self.color_idx, self.pen_size,
-                                      self.min_mult, self.max_mult, self.gamma)
-            self.current.add(ev.x, ev.y, ev.pressure)
-            n = len(self.current.points)
-            if n >= 2:
-                self._seg(self.current.points[n - 2], self.current.points[n - 1],
-                          self.current)
+                # 橡皮轨迹不作为笔画存储，只用于切割
+                self.current = Stroke(0 if erasing else self.color_idx,
+                                      self.pen_size, self.min_mult,
+                                      self.max_mult, CURVES[self.curve_name])
+                self.current.erasing_trace = erasing
+            self.current.add(x, y, p)
+            if erasing:
+                self._erase_dot((x, y, p))
             else:
-                self._seg(self.current.points[0], self.current.points[0],
-                          self.current)
+                n = len(self.current.points)
+                if n >= 2:
+                    self._seg(self.current.points[n - 2],
+                              self.current.points[n - 1], self.current)
+                else:
+                    self._seg(self.current.points[0],
+                              self.current.points[0], self.current)
         else:
             self.pen_down = False
+            self.filter.reset()
             if self.current is not None:
                 if len(self.current.points) >= 1:
                     self._finish_stroke(self.current)
                 self.current = None
 
     def _finish_stroke(self, stroke: Stroke):
-        if stroke.erasing and self._is_closed_lasso(stroke):
-            removed = self._lasso_erase(stroke)
-            self.status = f"圈选擦除 {removed} 笔"
-            return  # 套索本身不留痕
+        if getattr(stroke, "erasing_trace", False):
+            if self._is_closed_lasso(stroke):
+                removed = self._lasso_erase(stroke)
+                self.status = f"圈选擦除 {removed} 笔"
+            else:
+                split, gone = self._cut_erase(stroke)
+                self.status = f"擦除：切割 {split} 笔，删 {gone} 笔"
+            self.redraw_all()
+            return
         self.strokes.append(stroke)
 
     def _is_closed_lasso(self, stroke: Stroke) -> bool:
@@ -321,17 +398,62 @@ class Whiteboard:
 
     def _lasso_erase(self, lasso: Stroke) -> int:
         poly = [(p[0], p[1]) for p in lasso.points]
-        kept = []
-        removed = 0
+        kept, removed = [], 0
         for s in self.strokes:
             hits = sum(point_in_polygon(p[0], p[1], poly) for p in s.points)
-            if hits / len(s.points) > 0.5:
+            if len(s.points) and hits / len(s.points) > 0.5:
                 removed += 1
             else:
                 kept.append(s)
         self.strokes = kept
-        self.redraw_all()
         return removed
+
+    def _erase_radius_screen(self) -> float:
+        return 20 * self.canvas_h / BASE_WINDOW_H
+
+    def _cut_erase(self, eraser: Stroke):
+        """真正的对象切割：删除橡皮路径半径内的点，笔画在擦除处断开成多段。"""
+        r = self._erase_radius_screen()
+        r2 = r * r
+        ex_pts = [self.map_point(p[0], p[1]) for p in eraser.points]
+        # 橡皮轨迹的包围盒（屏幕坐标），粗筛加速
+        exs = [p[0] for p in ex_pts]
+        eys = [p[1] for p in ex_pts]
+        bbox = (min(exs) - r, min(eys) - r, max(exs) + r, max(eys) + r)
+
+        def erased(pt) -> bool:
+            x, y = self.map_point(pt[0], pt[1])
+            if not (bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]):
+                return False
+            for ex, ey in ex_pts:
+                if (x - ex) ** 2 + (y - ey) ** 2 <= r2:
+                    return True
+            return False
+
+        new_strokes, split, gone = [], 0, 0
+        for s in self.strokes:
+            runs = []
+            run = []
+            for pt in s.points:
+                if erased(pt):
+                    if run:
+                        runs.append(run)
+                        run = []
+                else:
+                    run.append(pt)
+            if run:
+                runs.append(run)
+            if len(runs) > 1:
+                split += 1
+            if not runs:
+                gone += 1
+            for run_pts in runs:
+                ns = Stroke(s.color_idx, s.pen_size, s.min_mult, s.max_mult,
+                            s.curve)
+                ns.points = run_pts
+                new_strokes.append(ns)
+        self.strokes = new_strokes
+        return split, gone
 
     def undo(self):
         if self.strokes:
@@ -366,14 +488,16 @@ class Whiteboard:
         for label, fn in (("撤销", self.undo),
                           ("清空", lambda: self._clear()),
                           ("保存", self.save),
-                          ("旋转", self._cycle_rotation)):
-            r = pygame.Rect(x, y - 16, 52, 32)
+                          ("旋转", self._cycle_rotation),
+                          ("曲线", self._cycle_curve),
+                          (f"平滑:{SMOOTH_LEVELS[self.smooth_idx][0]}",
+                           self._cycle_smooth)):
+            r = pygame.Rect(x, y - 16, 58, 32)
             self.buttons.append((r, fn, "text:" + label))
-            x += 60
+            x += 64
         eraser_label = "画笔" if self.erasing else "橡皮"
         r = pygame.Rect(x, y - 16, 52, 32)
         self.buttons.append((r, self._toggle_eraser, "text:" + eraser_label))
-        return x
 
     def _pick_color(self, i):
         self.color_idx = i
@@ -399,6 +523,17 @@ class Whiteboard:
         self._resize_canvas(self.window_w, self.window_h)
         self.status = f"旋转 {self.rotation}°"
 
+    def _cycle_curve(self):
+        names = list(CURVES)
+        self.curve_name = names[(names.index(self.curve_name) + 1) % len(names)]
+        self.status = f"曲线: {self.curve_name}"
+
+    def _cycle_smooth(self):
+        self.smooth_idx = (self.smooth_idx + 1) % len(SMOOTH_LEVELS)
+        name, alpha = SMOOTH_LEVELS[self.smooth_idx]
+        self.filter = SmoothFilter(alpha)
+        self.status = f"平滑: {name}"
+
     def _clear(self):
         self.strokes.clear()
         self.redraw_all()
@@ -408,29 +543,29 @@ class Whiteboard:
         bar = pygame.Rect(0, self.window_h - TOOLBAR_H, self.window_w, TOOLBAR_H)
         pygame.draw.rect(self.screen, (240, 238, 233), bar)
         pygame.draw.line(self.screen, (210, 208, 203), bar.topleft, bar.topright, 1)
-        end_x = self._make_buttons()
+        self._make_buttons()
+        color_rects = [b[0] for b in self.buttons[:4]]
+        size_rects = [b[0] for b in self.buttons[4:8]]
         for rect, fn, kind in self.buttons:
-            cy = rect.centery
             if kind == "color":
-                idx = [b[0].x for b in self.buttons[:4]].index(rect.x)
+                idx = color_rects.index(rect)
                 pygame.draw.circle(self.screen, self.COLORS[idx], rect.center, 12)
                 if idx == self.color_idx and not self.erasing:
                     pygame.draw.circle(self.screen, (80, 80, 80), rect.center, 15, 2)
             elif kind == "size":
-                idx = [b[0].x for b in self.buttons[4:8]].index(rect.x)
-                size = self.SIZES[idx]
-                if size == self.pen_size:
-                    pygame.draw.rect(self.screen, (180, 210, 180), rect, border_radius=6)
+                idx = size_rects.index(rect)
+                if self.SIZES[idx] == self.pen_size:
+                    pygame.draw.rect(self.screen, (180, 210, 180), rect,
+                                     border_radius=6)
                 scale = self.canvas_h / BASE_WINDOW_H
                 pygame.draw.circle(self.screen, (60, 60, 60), rect.center,
-                                   max(size * scale / 2, 1.5))
+                                   max(self.SIZES[idx] * scale / 2, 1.5))
             elif kind.startswith("text:"):
                 label = kind[5:]
-                bg = (210, 235, 210) if label in ("撤销", "清空", "保存") else (235, 225, 210)
+                bg = (215, 232, 215)
                 pygame.draw.rect(self.screen, bg, rect, border_radius=6)
                 t = self.small_font.render(label, True, (50, 50, 50))
                 self.screen.blit(t, t.get_rect(center=rect.center))
-        _ = end_x
 
     def handle_click(self, pos):
         for rect, fn, kind in self.buttons:
@@ -466,9 +601,9 @@ class Whiteboard:
                     elif e.key == pygame.K_r:
                         self._cycle_rotation()
                     elif e.key == pygame.K_p:
-                        self.curve_idx = (self.curve_idx + 1) % len(CURVE_PRESETS)
-                        self.gamma = CURVE_PRESETS[self.curve_idx][1]
-                        self.status = f"曲线: {CURVE_PRESETS[self.curve_idx][0]}"
+                        self._cycle_curve()
+                    elif e.key == pygame.K_m:
+                        self._cycle_smooth()
                     elif e.key == pygame.K_LEFTBRACKET:
                         self.min_mult = max(self.min_mult - 0.05, 0.05)
                         self.status = f"最细 {self.min_mult:.2f}x"
@@ -495,7 +630,8 @@ class Whiteboard:
 
             self.screen.blit(self.canvas, (0, 0))
             hud = (f"[{'●' if self.pen_down else '○'}] 压感 {self.show_pressure:4d} | "
-                   f"{self.rotation}° 曲线{CURVE_PRESETS[self.curve_idx][0]} "
+                   f"{self.rotation}° 曲线{self.curve_name} 平滑"
+                   f"{SMOOTH_LEVELS[self.smooth_idx][0]} "
                    f"{self.min_mult:.2f}-{self.max_mult:.2f}x | {self.status}")
             self.screen.blit(self.font.render(hud, True, (120, 120, 120)), (10, 8))
             self.draw_toolbar()
@@ -516,8 +652,10 @@ def main():
                     help="最轻压感时笔宽倍率（默认 0.2）")
     ap.add_argument("--max-mult", type=float, default=2.0,
                     help="最重压感时笔宽倍率（默认 2.0）")
-    ap.add_argument("--curve", type=float, default=1.0,
-                    help="压感 gamma 曲线：<1 轻压即粗，>1 需重压（默认 1.0）")
+    ap.add_argument("--curve", default="适中", choices=list(CURVES),
+                    help="压感曲线预设（默认 适中）")
+    ap.add_argument("--smooth", default="轻", choices=[n for n, _ in SMOOTH_LEVELS],
+                    help="笔迹平滑级别（默认 轻）")
     args = ap.parse_args()
 
     serial = args.serial or find_device_serial()
@@ -530,9 +668,10 @@ def main():
     reader = PenReader(serial, events)
     reader.start()
 
+    smooth_idx = [n for n, _ in SMOOTH_LEVELS].index(args.smooth)
     Whiteboard(args.width, args.min_pressure, args.pen_size,
                args.rotation, args.min_mult, args.max_mult,
-               args.curve).run(events, reader)
+               args.curve, smooth_idx).run(events, reader)
 
 
 if __name__ == "__main__":
