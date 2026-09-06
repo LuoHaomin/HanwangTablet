@@ -6,6 +6,7 @@
 """
 
 import argparse
+import math
 import os
 import queue
 import shutil
@@ -217,29 +218,28 @@ CURVES = {
     "硬笔": PressureCurve([(0, 0.0), (0.45, 0.18), (0.8, 0.5), (1, 1)]),
 }
 
-# 平滑级别: 显示名 -> EMA 系数（越小越平滑、延迟越大）
-SMOOTH_LEVELS = [("关", 1.0), ("轻", 0.65), ("中", 0.40), ("强", 0.22)]
+# 平滑级别: 显示名 -> 贝塞尔稳定器强度（0 关闭，越大越稳）
+SMOOTH_LEVELS = [("关", 0.0), ("轻", 0.35), ("中", 0.6), ("强", 0.8)]
+
+# 采样管线参数（移植自 Lorien）
+DEAD_ZONE = 2.0          # 距上一接受点 <= 此距离（设备单位）的点丢弃
+OPT_MIN_DIST = 4.0       # 优化器: 距离阈值
+OPT_ANGLE_DEG = 0.5      # 优化器: 方向变化阈值
+PRESSURE_MAX_DIFF = 0.05 # 压感限速: 相邻点压感最大变化
+PRESSURE_MIN = 0.1       # 压感下限
+VELOCITY_TAPER = 60.0    # 速度变细: 每事件移动 60 单位压感扣满 0.33
+DOT_MAX_LEN = 8.0        # 轻点判定: 总路程 <= 此值为点而非线
 
 
-class SmoothFilter:
-    """一阶指数平滑（EMA），对 x/y/pressure 同步滤波。"""
-
-    def __init__(self, alpha: float):
-        self.alpha = alpha
-        self.reset()
-
-    def reset(self):
-        self.fx = self.fy = self.fp = None
-
-    def apply(self, x, y, pressure):
-        if self.fx is None or self.alpha >= 1.0:
-            self.fx, self.fy, self.fp = float(x), float(y), float(pressure)
-            return x, y, pressure
-        a = self.alpha
-        self.fx += a * (x - self.fx)
-        self.fy += a * (y - self.fy)
-        self.fp += a * (pressure - self.fp)
-        return round(self.fx), round(self.fy), round(self.fp)
+def cubic_bezier(p0, p1, p2, p3, t):
+    """三次贝塞尔（Lorien 稳定器核心）。"""
+    u = 1.0 - t
+    b0 = u * u * u
+    b1 = 3 * u * u * t
+    b2 = 3 * u * t * t
+    b3 = t * t * t
+    return (b0 * p0[0] + b1 * p1[0] + b2 * p2[0] + b3 * p3[0],
+            b0 * p0[1] + b1 * p1[1] + b2 * p2[1] + b3 * p3[1])
 
 
 def point_in_polygon(px, py, poly) -> bool:
@@ -297,7 +297,10 @@ class Whiteboard:
         self.show_curve_editor = False
         self.drag_cp: int | None = None
         self.smooth_idx = smooth_idx
-        self.filter = SmoothFilter(SMOOTH_LEVELS[smooth_idx][1])
+        # 采样管线状态（Lorien 式）：stab 保留最近 3 个接受点
+        self.stab: list[tuple[float, float]] = []
+        self.last_press = 0.5
+        self.prev_angle: float | None = None
         self.window_w = width
         self.window_h = round(width * PEN_MAX_Y / PEN_MAX_X)
         if rotation in (90, 270):  # 竖拿时窗口用竖向比例
@@ -358,23 +361,31 @@ class Whiteboard:
                 ry / max_y * self.canvas_h)
 
     def _pressure_width(self, stroke, pressure) -> float:
-        """压感 → 宽度倍率：归一化压力过 PCHIP 曲线后映射到 [min_mult, max_mult]。"""
-        p = (pressure - self.min_pressure) / (PEN_MAX_PRESSURE - self.min_pressure)
-        f = stroke.curve(min(max(p, 0.0), 1.0))
+        """压感 → 宽度倍率：压力已归一化(0-1)，过 PCHIP 曲线后映射到 [min_mult, max_mult]。"""
+        f = stroke.curve(min(max(pressure, 0.0), 1.0))
         return stroke.min_mult + (stroke.max_mult - stroke.min_mult) * f
 
     def _seg(self, pt_a, pt_b, stroke):
-        """把一条线段画到 canvas。pt 为 (dev_x, dev_y, pressure)。"""
+        """变宽笔迹渲染：四边形条带（Lorien 的 Line2D 条带思路）+ 关节圆。"""
         scale = self.canvas_h / BASE_WINDOW_H
         color = self.COLORS[stroke.color_idx]
         base = stroke.pen_size * scale
         wa = max(base * self._pressure_width(stroke, pt_a[2]), 1)
         wb = max(base * self._pressure_width(stroke, pt_b[2]), 1)
-        ax, ay = self.map_point(*pt_a[:2])
-        bx, by = self.map_point(*pt_b[:2])
-        pygame.draw.line(self.canvas, color, (ax, ay), (bx, by),
-                         max(round((wa + wb) / 2), 1))
-        # 宽度渐变时用圆补两端，避免锯齿断裂
+        ax, ay = self.map_point(pt_a[0], pt_a[1])
+        bx, by = self.map_point(pt_b[0], pt_b[1])
+        dx, dy = bx - ax, by - ay
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            pygame.draw.circle(self.canvas, color, (ax, ay), wa / 2)
+            return
+        nx, ny = -dy / length, dx / length  # 法向
+        quad = [(ax + nx * wa / 2, ay + ny * wa / 2),
+                (bx + nx * wb / 2, by + ny * wb / 2),
+                (bx - nx * wb / 2, by - ny * wb / 2),
+                (ax - nx * wa / 2, ay - ny * wa / 2)]
+        pygame.draw.polygon(self.canvas, color, quad)
+        # 关节圆填补相邻四边形间的缝隙
         pygame.draw.circle(self.canvas, color, (ax, ay), wa / 2)
         pygame.draw.circle(self.canvas, color, (bx, by), wb / 2)
 
@@ -394,11 +405,61 @@ class Whiteboard:
 
     # ---- 笔事件 ----
 
+    def _pen_sample(self, ev: PenEvent):
+        """Lorien 式采样管线：死区 → 贝塞尔稳定器 → 速度变细 →
+        压感限速 → 点优化器。返回接受后的 (x, y, p_norm) 或 None。"""
+        x, y = float(ev.x), float(ev.y)
+        p = ev.pressure / PEN_MAX_PRESSURE
+        if not self.stab:  # 每笔第一个点直接透传，无启动延迟
+            self.stab = [(x, y)]
+            self.last_press = max(p, PRESSURE_MIN)
+            self.prev_angle = None
+            return x, y, max(p, PRESSURE_MIN)
+
+        lx, ly = self.stab[-1]
+        dist = ((x - lx) ** 2 + (y - ly) ** 2) ** 0.5
+        if dist <= DEAD_ZONE:
+            return None
+
+        # 贝塞尔稳定器：把新点拉向已有折线，快线不抖
+        strength = SMOOTH_LEVELS[self.smooth_idx][1]
+        if strength >= 0.01 and len(self.stab) >= 3:
+            t = 0.5 + (1.0 - strength) * 0.5
+            x, y = cubic_bezier(self.stab[-3], self.stab[-2],
+                                self.stab[-1], (x, y), t)
+            dist = ((x - lx) ** 2 + (y - ly) ** 2) ** 0.5
+
+        # 速度变细：运笔越快墨越淡（模拟真实笔锋）
+        p -= min(dist / VELOCITY_TAPER, 0.33)
+
+        # 压感限速：相邻点压感最多变化 0.05，消灭跳变
+        dp = p - self.last_press
+        if abs(dp) > PRESSURE_MAX_DIFF:
+            p = self.last_press + (PRESSURE_MAX_DIFF if dp > 0
+                                   else -PRESSURE_MAX_DIFF)
+        p = min(max(p, PRESSURE_MIN), 1.0)
+
+        # 点优化器：近距离且方向几乎不变的点不存
+        angle = math.atan2(y - ly, x - lx)
+        if dist < OPT_MIN_DIST and self.prev_angle is not None:
+            da = abs(angle - self.prev_angle)
+            da = min(da, 2 * math.pi - da)
+            if math.degrees(da) < OPT_ANGLE_DEG:
+                return None
+        self.prev_angle = angle
+
+        self.stab.append((x, y))
+        self.last_press = p
+        return x, y, p
+
     def handle_pen(self, ev: PenEvent):
         self.show_pressure = ev.pressure
         if ev.down:
             self.pen_down = True
-            x, y, p = self.filter.apply(ev.x, ev.y, ev.pressure)
+            sampled = self._pen_sample(ev)
+            if sampled is None:
+                return
+            x, y, p = sampled
             erasing = self.erasing or ev.rubber
             if self.current is None:
                 # 橡皮轨迹不作为笔画存储，只用于切割
@@ -419,7 +480,8 @@ class Whiteboard:
                               self.current.points[0], self.current)
         else:
             self.pen_down = False
-            self.filter.reset()
+            self.stab = []
+            self.prev_angle = None
             if self.current is not None:
                 if len(self.current.points) >= 1:
                     self._finish_stroke(self.current)
@@ -437,6 +499,17 @@ class Whiteboard:
             self.redraw_all()
             self._end_op(before)
             return
+        # 轻点判定：总路程极短的一笔渲染为一个圆点（Lorien 的 dot 处理）
+        pts = stroke.points
+        if len(pts) <= 6:
+            total = sum(math.hypot(pts[i][0] - pts[i - 1][0],
+                                   pts[i][1] - pts[i - 1][1])
+                        for i in range(1, len(pts)))
+            if total <= DOT_MAX_LEN:
+                cx = sum(pt[0] for pt in pts) / len(pts)
+                cy = sum(pt[1] for pt in pts) / len(pts)
+                stroke.points = [(cx - 1.5, cy, 0.5), (cx, cy, 0.5),
+                                 (cx + 1.5, cy, 0.5)]
         before = self._begin_op()
         self.strokes.append(stroke)
         self._end_op(before)
@@ -621,9 +694,7 @@ class Whiteboard:
 
     def _cycle_smooth(self):
         self.smooth_idx = (self.smooth_idx + 1) % len(SMOOTH_LEVELS)
-        name, alpha = SMOOTH_LEVELS[self.smooth_idx]
-        self.filter = SmoothFilter(alpha)
-        self.status = f"平滑: {name}"
+        self.status = f"平滑: {SMOOTH_LEVELS[self.smooth_idx][0]}"
 
     def _curve_panel(self) -> pygame.Rect:
         return pygame.Rect(self.window_w - 330, 36, 312, 232)
