@@ -43,21 +43,40 @@ LASSO_MIN_POINTS = 15
 LASSO_MAX_GAP_RATIO = 0.30
 
 
+def _adb(*args, timeout=5) -> str:
+    return subprocess.run([resolve_adb(), *args], capture_output=True,
+                          text=True, timeout=timeout).stdout
+
+
 def find_device_serial() -> str | None:
-    out = subprocess.run(
-        [resolve_adb(), "devices"], capture_output=True, text=True, timeout=5
-    ).stdout
-    for line in out.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) == 2 and parts[1] == "device":
-            # 优先选 IP 连接（当前唯一稳定通道）
-            if "." in parts[0]:
+    def scan() -> str | None:
+        out = _adb("devices")
+        for line in out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == "device":
+                if "." in parts[0]:  # 优先 IP 连接（当前唯一稳定通道）
+                    return parts[0]
+        for line in out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == "device":
                 return parts[0]
-    for line in out.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) == 2 and parts[1] == "device":
-            return parts[0]
-    return None
+        return None
+
+    dev = scan()
+    if dev:
+        return dev
+
+    # 没有已连接设备时，用 mDNS 自动发现无线调试端口并连接
+    # （设备每次重启/休眠唤醒后端口会变，手动抄不可靠）
+    try:
+        for line in _adb("mdns", "services").splitlines():
+            parts = line.split()
+            # 格式: adb-XXXX _adb-tls-connect._tcp. 10.x.x.x:port
+            if len(parts) >= 3 and "_adb-tls-connect._tcp" in parts[1]:
+                _adb("connect", parts[2], timeout=3)
+    except Exception:  # noqa: BLE001
+        pass
+    return scan()
 
 
 class PenEvent:
@@ -104,6 +123,13 @@ class PenReader(threading.Thread):
                 if proc is not None:
                     proc.terminate()
             if not self.stop_flag.is_set():
+                # 设备休眠唤醒/重启后无线调试端口会变，重新发现
+                try:
+                    found = find_device_serial()
+                    if found:
+                        self.serial = found
+                except Exception:  # noqa: BLE001
+                    pass
                 time.sleep(1.0)  # 断线后 1s 重试
 
     def _parse_stream(self, proc: subprocess.Popen):
