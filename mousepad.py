@@ -16,10 +16,15 @@ import pygame
 from Quartz import (
     CGEventCreateMouseEvent,
     CGEventPost,
+    CGEventSetDoubleValueField,
+    CGEventSetIntegerValueField,
     kCGEventLeftMouseDown,
     kCGEventLeftMouseDragged,
     kCGEventLeftMouseUp,
     kCGEventMouseMoved,
+    kCGEventMouseSubtypeTabletPoint,
+    kCGMouseEventPressure,
+    kCGMouseEventSubtype,
     kCGEventRightMouseDown,
     kCGEventRightMouseDragged,
     kCGEventRightMouseUp,
@@ -69,16 +74,24 @@ class MouseMapper:
         y = self.off_y + dy / PEN_MAX_Y * self.area_h
         return x, y
 
-    def post(self, kind, x, y, button=0):
+    def post(self, kind, x, y, button=0, pressure: float | None = None):
         e = CGEventCreateMouseEvent(None, kind, (x, y), button)
+        if pressure is not None:
+            # tablet 事件合成：subtype=tabletPoint + 压力字段（0-1），
+            # Freeform/Notes 等用 PencilKit 的应用会据此画出压感笔迹
+            CGEventSetIntegerValueField(e, kCGMouseEventSubtype,
+                                        kCGEventMouseSubtypeTabletPoint)
+            CGEventSetDoubleValueField(e, kCGMouseEventPressure,
+                                       min(max(pressure, 0.0), 1.0))
         CGEventPost(kCGHIDEventTap, e)
 
     def handle(self, ev: PenEvent):
         x, y = self.to_screen(ev)
+        p = ev.pressure / 1024 if ev.down else None
         if ev.rubber:
             kind = (kCGEventRightMouseDragged if self.right_down
                     else kCGEventRightMouseDown)
-            self.post(kind, x, y, 1)
+            self.post(kind, x, y, 1, p)
             self.right_down = True
             return
         if self.right_down:  # 橡皮翻回笔尖，先抬起右键
@@ -87,7 +100,7 @@ class MouseMapper:
         if ev.down:
             kind = (kCGEventLeftMouseDragged if self.left_down
                     else kCGEventLeftMouseDown)
-            self.post(kind, x, y)
+            self.post(kind, x, y, 0, p)
             self.left_down = True
         else:
             if self.left_down:
