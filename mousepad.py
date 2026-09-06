@@ -2,19 +2,19 @@
 """汉王 N10 Plus 鼠标模式（无压感）。
 
 把笔的绝对坐标映射到主显示器，笔尖接触/抬起 = 鼠标左键按下/抬起，
-笔尾橡皮 = 鼠标右键。Ctrl+C 退出。
+笔尾橡皮 = 鼠标右键。
 
-注意：CGEvent 注入需要在 系统设置 → 隐私与安全性 → 辅助功能 中
-授权运行本程序的终端 App。
+带一个小状态窗口（Esc 或关窗退出），可在 .app 中无终端运行。
+CGEvent 注入需要 系统设置 → 隐私与安全性 → 辅助功能 授权。
 """
 
 import argparse
+import queue
 import sys
-import time
 
+import pygame
 from Quartz import (
     CGEventCreateMouseEvent,
-    CGEventGetLocation,
     CGEventPost,
     kCGEventLeftMouseDown,
     kCGEventLeftMouseDragged,
@@ -25,16 +25,11 @@ from Quartz import (
     kCGEventRightMouseUp,
     kCGHIDEventTap,
     CGMainDisplayID,
-    CGDisplayScreenSize,
     CGDisplayBounds,
 )
 from Quartz.CoreGraphics import CGDisplayPixelsWide, CGDisplayPixelsHigh
 
 from main import PEN_MAX_X, PEN_MAX_Y, PenEvent, PenReader, find_device_serial
-
-# N10 Plus 屏幕物理比例 1872x1404 (10.3", 4:3)。主显示器通常 16:9，
-# 按面积等比缩放笔区，让移动距离手感一致，而不是强制铺满全屏。
-SCALE_MM = 1.0
 
 
 class MouseMapper:
@@ -45,12 +40,11 @@ class MouseMapper:
         self.screen_w = CGDisplayPixelsWide(display_id)
         self.screen_h = CGDisplayPixelsHigh(display_id)
         self.bounds = CGDisplayBounds(display_id)
-        # 设备可写区域按 4:3 保持比例居中于屏幕
         if full_screen:
             self.area_w, self.area_h = self.screen_w, self.screen_h
         else:
-            mm = CGDisplayScreenSize(display_id)  # (w_mm, h_mm)
-            area_ratio = 1872 / 1404
+            # N10 是 4:3，按比例居中映射保持手感
+            area_ratio = PEN_MAX_X / PEN_MAX_Y
             screen_ratio = self.screen_w / self.screen_h
             if screen_ratio > area_ratio:
                 self.area_h = self.screen_h
@@ -103,6 +97,50 @@ class MouseMapper:
                 self.post(kCGEventMouseMoved, x, y)
 
 
+def start_mousepad(serial: str | None = None, full_screen: bool = False,
+                   rotation: int = 0):
+    """带小状态窗口运行，供 CLI 和 .app 启动器共用。"""
+    serial = serial or find_device_serial()
+    if not serial:
+        print("未发现 adb 设备，请先: adb connect <设备IP>:<端口>", file=sys.stderr)
+        sys.exit(1)
+
+    mapper = MouseMapper(full_screen, rotation)
+    pygame.init()
+    screen = pygame.display.set_mode((380, 150))
+    pygame.display.set_caption("汉王鼠标模式")
+    font = pygame.font.SysFont("pingfangsc,hiraginosansgb", 14)
+
+    events: queue.Queue = queue.Queue()
+    reader = PenReader(serial, events)
+    reader.start()
+
+    clock = pygame.time.Clock()
+    while True:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT or \
+                    (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
+                reader.stop()
+                pygame.quit()
+                return
+        try:
+            while True:
+                mapper.handle(events.get_nowait())
+        except queue.Empty:
+            pass
+        screen.fill((250, 248, 244))
+        lines = [
+            "鼠标模式运行中（Esc 或关窗退出）",
+            "笔尖 = 左键按下/拖动    笔尾 = 右键",
+            f"设备: {serial}",
+            "已连接" if reader.connected.is_set() else "连接断开，重试中...",
+        ]
+        for i, line in enumerate(lines):
+            screen.blit(font.render(line, True, (60, 60, 60)), (14, 14 + i * 30))
+        pygame.display.flip()
+        clock.tick(60)
+
+
 def main():
     ap = argparse.ArgumentParser(description="汉王 N10 Plus 鼠标模式（无压感）")
     ap.add_argument("--serial", help="adb 设备序列号，默认自动检测")
@@ -111,33 +149,7 @@ def main():
     ap.add_argument("--rotation", type=int, default=0, choices=[0, 90, 180, 270],
                     help="设备摆放旋转角（默认 0，竖拿用 90 或 270）")
     args = ap.parse_args()
-
-    serial = args.serial or find_device_serial()
-    if not serial:
-        print("未发现 adb 设备，请先: adb connect <设备IP>:<端口>", file=sys.stderr)
-        sys.exit(1)
-
-    mapper = MouseMapper(args.full_screen, args.rotation)
-    mode = "铺满屏幕" if args.full_screen else f"映射区 {mapper.area_w:.0f}x{mapper.area_h:.0f} 居中"
-    print(f"设备: {serial} | 屏幕: {mapper.screen_w}x{mapper.screen_h} | {mode}")
-    print("笔尖=左键拖动，笔尾=右键。Ctrl+C 退出。")
-
-    import queue
-    events: queue.Queue = queue.Queue()
-    reader = PenReader(serial, events)
-    reader.start()
-
-    try:
-        while True:
-            try:
-                mapper.handle(events.get(timeout=1))
-            except queue.Empty:
-                if not reader.connected.is_set():
-                    print("连接断开，重试中...", file=sys.stderr)
-    except KeyboardInterrupt:
-        print("\n退出")
-    finally:
-        reader.stop()
+    start_mousepad(args.serial, args.full_screen, args.rotation)
 
 
 if __name__ == "__main__":

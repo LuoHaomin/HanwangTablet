@@ -6,13 +6,27 @@
 """
 
 import argparse
+import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
 import time
 
 import pygame
+
+
+def resolve_adb() -> str:
+    """Finder 启动的 .app 没有 shell PATH，补上常见安装位置。"""
+    adb = shutil.which("adb")
+    if adb:
+        return adb
+    for p in ("/opt/homebrew/bin/adb", "/usr/local/bin/adb",
+              os.path.expanduser("~/homebrew/bin/adb")):
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("找不到 adb，请安装: brew install android-platform-tools")
 
 PEN_MAX_X = 1872
 PEN_MAX_Y = 1404
@@ -31,7 +45,7 @@ LASSO_MAX_GAP_RATIO = 0.30
 
 def find_device_serial() -> str | None:
     out = subprocess.run(
-        ["adb", "devices"], capture_output=True, text=True, timeout=5
+        [resolve_adb(), "devices"], capture_output=True, text=True, timeout=5
     ).stdout
     for line in out.splitlines()[1:]:
         parts = line.split()
@@ -73,7 +87,7 @@ class PenReader(threading.Thread):
             proc = None
             try:
                 proc = subprocess.Popen(
-                    ["adb", "-s", self.serial, "shell",
+                    [resolve_adb(), "-s", self.serial, "shell",
                      "getevent", "-lt", INPUT_DEVICE],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -501,7 +515,8 @@ class Whiteboard:
             self.status = "没有可重做的操作"
 
     def save(self):
-        path = f"note-{time.strftime('%Y%m%d-%H%M%S')}.png"
+        desktop = os.path.expanduser("~/Desktop")
+        path = os.path.join(desktop, f"note-{time.strftime('%Y%m%d-%H%M%S')}.png")
         pygame.image.save(self.canvas, path)
         self.status = f"已保存 {path}"
 
@@ -772,6 +787,21 @@ class Whiteboard:
                 self.draw_curve_editor()
             pygame.display.flip()
             clock.tick(120)
+
+
+def start_whiteboard(serial: str | None = None, width: int = 1123):
+    """供 CLI 和 .app 启动器共用的入口。"""
+    serial = serial or find_device_serial()
+    if not serial:
+        print("未发现 adb 设备，请先: adb connect <设备IP>:<端口>", file=sys.stderr)
+        sys.exit(1)
+    print(f"使用设备: {serial}")
+
+    events: queue.Queue[PenEvent] = queue.Queue()
+    reader = PenReader(serial, events)
+    reader.start()
+
+    Whiteboard(width, 50, 6.0).run(events, reader)
 
 
 def main():
