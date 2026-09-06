@@ -886,12 +886,50 @@ class Whiteboard:
             clock.tick(120)
 
 
+def no_device_dialog() -> bool:
+    """未发现设备时的提示窗。返回 True=重试，False=退出。"""
+    pygame.init()
+    screen = pygame.display.set_mode((420, 190))
+    pygame.display.set_caption("汉王手写板")
+    font = pygame.font.SysFont("pingfangsc,hiraginosansgb", 16)
+    small = pygame.font.SysFont("pingfangsc,hiraginosansgb", 13)
+    retry_btn = pygame.Rect(110, 110, 90, 44)
+    quit_btn = pygame.Rect(220, 110, 90, 44)
+    clock = pygame.time.Clock()
+    while True:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                pygame.quit()
+                return False
+            if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                if retry_btn.collidepoint(e.pos):
+                    pygame.quit()
+                    return True
+                if quit_btn.collidepoint(e.pos):
+                    pygame.quit()
+                    return False
+        screen.fill((250, 248, 244))
+        screen.blit(font.render("未发现汉王设备", True, (200, 60, 60)), (110, 24))
+        screen.blit(small.render("请在设备上打开无线调试页面，确保已连接", True,
+                                 (120, 120, 120)), (66, 62))
+        screen.blit(small.render("同一网络（必要时先 adb connect / kill-server）",
+                                 True, (120, 120, 120)), (58, 84))
+        for rect, label, bg in ((retry_btn, "重试", (200, 225, 200)),
+                                (quit_btn, "退出", (230, 210, 210))):
+            pygame.draw.rect(screen, bg, rect, border_radius=8)
+            t = font.render(label, True, (40, 40, 40))
+            screen.blit(t, t.get_rect(center=rect.center))
+        pygame.display.flip()
+        clock.tick(30)
+
+
 def start_whiteboard(serial: str | None = None, width: int = 1123):
     """供 CLI 和 .app 启动器共用的入口。"""
     serial = serial or find_device_serial()
-    if not serial:
-        print("未发现 adb 设备，请先: adb connect <设备IP>:<端口>", file=sys.stderr)
-        sys.exit(1)
+    while serial is None:
+        if not no_device_dialog():
+            sys.exit(0)
+        serial = find_device_serial()
     print(f"使用设备: {serial}")
 
     events: queue.Queue[PenEvent] = queue.Queue()
