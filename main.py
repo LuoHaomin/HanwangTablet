@@ -6,6 +6,7 @@
 """
 
 import argparse
+import json
 import math
 import os
 import queue
@@ -35,9 +36,11 @@ PEN_MAX_PRESSURE = 1024
 
 INPUT_DEVICE = "/dev/input/event7"
 
+# 会话自动保存位置（矢量 JSON，关窗后下次启动恢复）
+SESSION_FILE = os.path.expanduser("~/.hanwang-tablet/autosave.json")
+
 BG_COLOR = (250, 248, 244)
 TOOLBAR_H = 52
-BASE_WINDOW_H = 842  # width=1123 时的窗口高度，笔宽缩放以此为基准
 
 # 圈选擦除的判定阈值：闭合缺口须小于圈直径的此比例，且点数足够
 LASSO_MIN_POINTS = 15
@@ -94,10 +97,13 @@ class PenEvent:
 class PenReader(threading.Thread):
     """后台线程：保持 adb getevent 流存活，解析事件，断线自动重连。"""
 
-    def __init__(self, serial: str, out: queue.Queue[PenEvent]):
+    def __init__(self, serial: str, out: queue.Queue[PenEvent],
+                 keep_awake: bool = True):
         super().__init__(daemon=True)
         self.serial = serial
         self.out = out
+        self.keep_awake = keep_awake
+        self._old_timeout: str | None = None
         self.stop_flag = threading.Event()
         self.connected = threading.Event()
         self.last_error: str | None = None
@@ -116,6 +122,8 @@ class PenReader(threading.Thread):
                 )
                 self.connected.set()
                 self.last_error = None
+                if self.keep_awake:
+                    self._wake_on()
                 self._parse_stream(proc)
             except Exception as e:  # noqa: BLE001
                 self.last_error = str(e)
@@ -171,6 +179,39 @@ class PenReader(threading.Thread):
 
     def stop(self):
         self.stop_flag.set()
+        self._wake_off()
+
+    def _adb_shell(self, *args):
+        subprocess.run([resolve_adb(), "-s", self.serial, "shell", *args],
+                       capture_output=True, timeout=3)
+
+    def _wake_on(self):
+        """连接期间阻止设备休眠：临时把息屏超时调到最大，断开时恢复。"""
+        if self._old_timeout is not None:
+            return
+        try:
+            out = subprocess.run(
+                [resolve_adb(), "-s", self.serial, "shell",
+                 "settings", "get", "system", "screen_off_timeout"],
+                capture_output=True, text=True, timeout=3).stdout.strip()
+            if out.isdigit():
+                self._old_timeout = out
+                self._adb_shell("settings", "put", "system",
+                                "screen_off_timeout", "2147483647")
+                self._adb_shell("svc", "power", "stayon", "true")
+        except Exception:  # noqa: BLE001
+            self._old_timeout = None
+
+    def _wake_off(self):
+        if self._old_timeout is None:
+            return
+        try:
+            self._adb_shell("settings", "put", "system",
+                            "screen_off_timeout", self._old_timeout)
+            self._adb_shell("svc", "power", "stayon", "false")
+        except Exception:  # noqa: BLE001
+            pass
+        self._old_timeout = None
 
 
 class PressureCurve:
@@ -226,7 +267,6 @@ DEAD_ZONE = 2.0          # 距上一接受点 <= 此距离（设备单位）的�
 OPT_MIN_DIST = 4.0       # 优化器: 距离阈值
 OPT_ANGLE_DEG = 0.5      # 优化器: 方向变化阈值
 PRESSURE_MAX_DIFF = 0.05 # 压感限速: 相邻点压感最大变化
-PRESSURE_MIN = 0.1       # 压感下限
 VELOCITY_TAPER = 60.0    # 速度变细: 每事件移动 60 单位压感扣满 0.33
 DOT_MAX_LEN = 8.0        # 轻点判定: 总路程 <= 此值为点而非线
 
@@ -286,7 +326,7 @@ class Whiteboard:
                  rotation: int = 0, min_mult: float = 0.2,
                  max_mult: float = 2.0, curve_name: str = "适中",
                  smooth_idx: int = 1):
-        self.min_pressure = min_pressure
+        self.pressure_min = min_pressure / PEN_MAX_PRESSURE  # 压感下限(归一化)
         self.rotation = rotation
         self.min_mult = min_mult
         self.max_mult = max_mult
@@ -330,8 +370,14 @@ class Whiteboard:
         self.show_pressure = 0
         self.pen_down = False
         self.buttons: list[tuple[pygame.Rect, callable, str]] = []
+        self._dirty = False
+        self._last_save = 0.0
+        self.last_activity = time.monotonic()
 
         self._resize_canvas(self.window_w, self.window_h)
+        restored = self.load_session()
+        if restored:
+            self.status = f"已恢复上次笔记（{restored} 笔）"
 
     # ---- 坐标与绘制 ----
 
@@ -365,9 +411,15 @@ class Whiteboard:
         f = stroke.curve(min(max(pressure, 0.0), 1.0))
         return stroke.min_mult + (stroke.max_mult - stroke.min_mult) * f
 
+    def _draw_scale(self) -> float:
+        """设备单位 → 像素的缩放。以横向映射为基准（旋转后画布宽对应轴互换），
+        保证横竖切换时同一笔画的渲染粗细一致；1.5641 校准到旧版默认手感。"""
+        max_x = PEN_MAX_Y if self.rotation in (90, 270) else PEN_MAX_X
+        return (self.canvas_w / max_x) * 1.5641
+
     def _seg(self, pt_a, pt_b, stroke):
         """变宽笔迹渲染：四边形条带（Lorien 的 Line2D 条带思路）+ 关节圆。"""
-        scale = self.canvas_h / BASE_WINDOW_H
+        scale = self._draw_scale()
         color = self.COLORS[stroke.color_idx]
         base = stroke.pen_size * scale
         wa = max(base * self._pressure_width(stroke, pt_a[2]), 1)
@@ -399,7 +451,7 @@ class Whiteboard:
 
     def _erase_dot(self, pt):
         """橡皮拖动时的实时视觉反馈（画底色圆）。"""
-        scale = self.canvas_h / BASE_WINDOW_H
+        scale = self._draw_scale()
         x, y = self.map_point(pt[0], pt[1])
         pygame.draw.circle(self.canvas, BG_COLOR, (x, y), 20 * scale)
 
@@ -412,9 +464,9 @@ class Whiteboard:
         p = ev.pressure / PEN_MAX_PRESSURE
         if not self.stab:  # 每笔第一个点直接透传，无启动延迟
             self.stab = [(x, y)]
-            self.last_press = max(p, PRESSURE_MIN)
+            self.last_press = max(p, self.pressure_min)
             self.prev_angle = None
-            return x, y, max(p, PRESSURE_MIN)
+            return x, y, max(p, self.pressure_min)
 
         lx, ly = self.stab[-1]
         dist = ((x - lx) ** 2 + (y - ly) ** 2) ** 0.5
@@ -437,7 +489,7 @@ class Whiteboard:
         if abs(dp) > PRESSURE_MAX_DIFF:
             p = self.last_press + (PRESSURE_MAX_DIFF if dp > 0
                                    else -PRESSURE_MAX_DIFF)
-        p = min(max(p, PRESSURE_MIN), 1.0)
+        p = min(max(p, self.pressure_min), 1.0)
 
         # 点优化器：近距离且方向几乎不变的点不存
         angle = math.atan2(y - ly, x - lx)
@@ -449,6 +501,7 @@ class Whiteboard:
         self.prev_angle = angle
 
         self.stab.append((x, y))
+        del self.stab[:-4]  # 稳定器只需要最近 3 个点
         self.last_press = p
         return x, y, p
 
@@ -541,21 +594,30 @@ class Whiteboard:
         return removed
 
     def _erase_radius_screen(self) -> float:
-        return 20 * self.canvas_h / BASE_WINDOW_H
+        return 20 * self._draw_scale()
 
     def _cut_erase(self, eraser: Stroke):
         """真正的对象切割：删除橡皮路径半径内的点，笔画在擦除处断开成多段。"""
         r = self._erase_radius_screen()
         r2 = r * r
         ex_pts = [self.map_point(p[0], p[1]) for p in eraser.points]
-        # 橡皮轨迹的包围盒（屏幕坐标），粗筛加速
         exs = [p[0] for p in ex_pts]
         eys = [p[1] for p in ex_pts]
-        bbox = (min(exs) - r, min(eys) - r, max(exs) + r, max(eys) + r)
+        ebbox = (min(exs) - r, min(eys) - r, max(exs) + r, max(eys) + r)
+
+        def stroke_screen_bbox(s):
+            # 90° 倍数的旋转下，设备坐标包围盒的 4 角映射后仍是轴对齐极值
+            dxs = [p[0] for p in s.points]
+            dys = [p[1] for p in s.points]
+            corners = [self.map_point(x, y)
+                       for x in (min(dxs), max(dxs))
+                       for y in (min(dys), max(dys))]
+            return (min(c[0] for c in corners), min(c[1] for c in corners),
+                    max(c[0] for c in corners), max(c[1] for c in corners))
 
         def erased(pt) -> bool:
             x, y = self.map_point(pt[0], pt[1])
-            if not (bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]):
+            if not (ebbox[0] <= x <= ebbox[2] and ebbox[1] <= y <= ebbox[3]):
                 return False
             for ex, ey in ex_pts:
                 if (x - ex) ** 2 + (y - ey) ** 2 <= r2:
@@ -564,6 +626,11 @@ class Whiteboard:
 
         new_strokes, split, gone = [], 0, 0
         for s in self.strokes:
+            bb = stroke_screen_bbox(s)  # 粗筛：包围盒不相交的笔画整条跳过
+            if bb[2] < ebbox[0] or bb[0] > ebbox[2] or \
+                    bb[3] < ebbox[1] or bb[1] > ebbox[3]:
+                new_strokes.append(s)
+                continue
             runs = []
             run = []
             for pt in s.points:
@@ -594,6 +661,7 @@ class Whiteboard:
         self.history = self.history[:self.h_idx]  # 丢弃被撤销分支
         self.history.append((before, list(self.strokes)))
         self.h_idx = len(self.history)
+        self._dirty = True  # 会话待保存
 
     def undo(self):
         if self.h_idx > 0:
@@ -618,6 +686,106 @@ class Whiteboard:
         path = os.path.join(desktop, f"note-{time.strftime('%Y%m%d-%H%M%S')}.png")
         pygame.image.save(self.canvas, path)
         self.status = f"已保存 {path}"
+
+    # ---- 会话持久化（JSON 矢量）与 SVG 导出 ----
+
+    def _curve_name_of(self, stroke: Stroke) -> str:
+        if stroke.curve is self.custom_curve:
+            return "自定义"
+        for name, c in CURVES.items():
+            if stroke.curve is c:
+                return name
+        return "适中"
+
+    def save_session(self):
+        data = {
+            "version": 1,
+            "rotation": self.rotation,
+            "strokes": [
+                {
+                    "color": s.color_idx, "size": s.pen_size,
+                    "min": s.min_mult, "max": s.max_mult,
+                    "curve": self._curve_name_of(s),
+                    "custom": (self.custom_points
+                               if self._curve_name_of(s) == "自定义" else None),
+                    "points": s.points,
+                }
+                for s in self.strokes
+            ],
+        }
+        os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+        tmp = SESSION_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, SESSION_FILE)
+
+    def load_session(self) -> int:
+        """启动时恢复上次会话。返回恢复的笔画数（无文件/损坏返回 0）。"""
+        if not os.path.exists(SESSION_FILE):
+            return 0
+        try:
+            with open(SESSION_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            self.rotation = int(data.get("rotation", 0))
+            loaded = []
+            for d in data.get("strokes", []):
+                if d.get("curve") == "自定义" and d.get("custom"):
+                    self.custom_points = [tuple(p) for p in d["custom"]]
+                    self.custom_curve = PressureCurve(self.custom_points)
+                    curve = self.custom_curve
+                else:
+                    curve = CURVES.get(d.get("curve", "适中"), CURVES["适中"])
+                s = Stroke(d["color"], d["size"], d["min"], d["max"], curve)
+                s.points = [tuple(p) for p in d["points"]]
+                loaded.append(s)
+            self.strokes = loaded
+            self.redraw_all()
+            return len(loaded)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def export_svg(self):
+        """SVG 矢量导出：每段一个四边形 + 关节圆，与屏幕渲染一致。"""
+        desktop = os.path.expanduser("~/Desktop")
+        path = os.path.join(desktop, f"note-{time.strftime('%Y%m%d-%H%M%S')}.svg")
+        w, h = self.canvas_w, self.canvas_h
+        out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+               f'viewBox="0 0 {w} {h}">',
+               f'<rect width="100%" height="100%" fill="rgb({BG_COLOR[0]},{BG_COLOR[1]},{BG_COLOR[2]})"/>']
+        for s in self.strokes:
+            c = self.COLORS[s.color_idx]
+            fill = f'fill="rgb({c[0]},{c[1]},{c[2]})"'
+            pts = s.points
+            for i in range(max(len(pts) - 1, 0)):
+                self._svg_seg(out, pts[i], pts[i + 1], s, fill)
+            if pts:
+                self._svg_seg(out, pts[0], pts[0], s, fill)
+        out.append("</svg>")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out))
+        self.status = f"已导出 {path}"
+
+    def _svg_seg(self, out, pt_a, pt_b, stroke, fill):
+        scale = self._draw_scale()
+        base = stroke.pen_size * scale
+        wa = max(base * self._pressure_width(stroke, pt_a[2]), 1)
+        wb = max(base * self._pressure_width(stroke, pt_b[2]), 1)
+        ax, ay = self.map_point(pt_a[0], pt_a[1])
+        bx, by = self.map_point(pt_b[0], pt_b[1])
+        dx, dy = bx - ax, by - ay
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            out.append(f'<circle cx="{ax:.1f}" cy="{ay:.1f}" r="{wa/2:.1f}" {fill}/>')
+            return
+        nx, ny = -dy / length, dx / length
+        quad = [(ax + nx * wa / 2, ay + ny * wa / 2),
+                (bx + nx * wb / 2, by + ny * wb / 2),
+                (bx - nx * wb / 2, by - ny * wb / 2),
+                (ax - nx * wa / 2, ay - ny * wa / 2)]
+        pstr = " ".join(f"{x:.1f},{y:.1f}" for x, y in quad)
+        out.append(f'<polygon points="{pstr}" {fill}/>')
+        out.append(f'<circle cx="{ax:.1f}" cy="{ay:.1f}" r="{wa/2:.1f}" {fill}/>')
+        out.append(f'<circle cx="{bx:.1f}" cy="{by:.1f}" r="{wb/2:.1f}" {fill}/>')
 
     # ---- 工具栏 ----
 
@@ -791,7 +959,7 @@ class Whiteboard:
                 if self.SIZES[idx] == self.pen_size:
                     pygame.draw.rect(self.screen, (180, 210, 180), rect,
                                      border_radius=6)
-                scale = self.canvas_h / BASE_WINDOW_H
+                scale = self._draw_scale()
                 pygame.draw.circle(self.screen, (60, 60, 60), rect.center,
                                    max(self.SIZES[idx] * scale / 2, 1.5))
             elif kind.startswith("text:"):
@@ -813,7 +981,12 @@ class Whiteboard:
         clock = pygame.time.Clock()
         while True:
             for e in pygame.event.get():
+                self.last_activity = time.monotonic()
                 if e.type == pygame.QUIT:
+                    try:
+                        self.save_session()
+                    except Exception:  # noqa: BLE001
+                        pass
                     reader.stop()
                     pygame.quit()
                     return
@@ -841,6 +1014,8 @@ class Whiteboard:
                         self._clear()
                     elif e.key == pygame.K_s:
                         self.save()
+                    elif e.key == pygame.K_x:
+                        self.export_svg()
                     elif e.key == pygame.K_e:
                         self._toggle_eraser()
                     elif e.key == pygame.K_r:
@@ -864,11 +1039,24 @@ class Whiteboard:
                     elif pygame.K_1 <= e.key <= pygame.K_4:
                         self._pick_color(e.key - pygame.K_1)
 
+            got_any = False
             try:
                 while True:
                     self.handle_pen(events.get_nowait())
+                    got_any = True
             except queue.Empty:
                 pass
+            if got_any:
+                self.last_activity = time.monotonic()
+
+            # 会话自动保存（脏后至多 2 秒一次）
+            if self._dirty and time.monotonic() - self._last_save > 2:
+                try:
+                    self.save_session()
+                    self._dirty = False
+                except Exception:  # noqa: BLE001
+                    pass
+                self._last_save = time.monotonic()
 
             if not reader.connected.is_set():
                 self.status = f"连接断开，重试中... {reader.last_error or ''}"
@@ -883,7 +1071,37 @@ class Whiteboard:
             if self.show_curve_editor:
                 self.draw_curve_editor()
             pygame.display.flip()
-            clock.tick(120)
+            # 空闲时降帧省电，落笔/交互立即恢复
+            fps = 30 if time.monotonic() - self.last_activity > 2 else 120
+            clock.tick(fps)
+
+
+def error_dialog(title: str, lines: list[str]):
+    """错误提示窗（仅退出按钮）。"""
+    pygame.init()
+    screen = pygame.display.set_mode((440, 100 + 28 * len(lines)))
+    pygame.display.set_caption("汉王手写板")
+    font = pygame.font.SysFont("pingfangsc,hiraginosansgb", 16)
+    small = pygame.font.SysFont("pingfangsc,hiraginosansgb", 13)
+    quit_btn = pygame.Rect(175, 50 + 28 * len(lines), 90, 40)
+    clock = pygame.time.Clock()
+    while True:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT or \
+                    (e.type == pygame.MOUSEBUTTONDOWN and e.button == 1
+                     and quit_btn.collidepoint(e.pos)):
+                pygame.quit()
+                return
+        screen.fill((250, 248, 244))
+        screen.blit(font.render(title, True, (200, 60, 60)), (20, 16))
+        for i, line in enumerate(lines):
+            screen.blit(small.render(line, True, (120, 120, 120)),
+                        (20, 48 + i * 28))
+        pygame.draw.rect(screen, (230, 210, 210), quit_btn, border_radius=8)
+        t = font.render("退出", True, (40, 40, 40))
+        screen.blit(t, t.get_rect(center=quit_btn.center))
+        pygame.display.flip()
+        clock.tick(30)
 
 
 def no_device_dialog() -> bool:
@@ -923,9 +1141,14 @@ def no_device_dialog() -> bool:
         clock.tick(30)
 
 
-def start_whiteboard(serial: str | None = None, width: int = 1123):
+def start_whiteboard(serial: str | None = None, width: int = 1123,
+                     keep_awake: bool = True):
     """供 CLI 和 .app 启动器共用的入口。"""
-    serial = serial or find_device_serial()
+    try:
+        serial = serial or find_device_serial()
+    except FileNotFoundError as e:
+        error_dialog("缺少 adb", [str(e)])
+        sys.exit(1)
     while serial is None:
         if not no_device_dialog():
             sys.exit(0)
@@ -933,7 +1156,7 @@ def start_whiteboard(serial: str | None = None, width: int = 1123):
     print(f"使用设备: {serial}")
 
     events: queue.Queue[PenEvent] = queue.Queue()
-    reader = PenReader(serial, events)
+    reader = PenReader(serial, events, keep_awake=keep_awake)
     reader.start()
 
     Whiteboard(width, 50, 6.0).run(events, reader)
@@ -944,7 +1167,7 @@ def main():
     ap.add_argument("--serial", help="adb 设备序列号，默认自动检测")
     ap.add_argument("--width", type=int, default=1123, help="窗口宽度（默认 1123）")
     ap.add_argument("--min-pressure", type=int, default=50,
-                    help="低于此压感不画线（过滤悬空噪声，默认 50）")
+                    help="压感下限 0-1024，低于此值按此值计算（默认 50）")
     ap.add_argument("--pen-size", type=float, default=6.0, help="基准笔宽（默认 6）")
     ap.add_argument("--rotation", type=int, default=0, choices=[0, 90, 180, 270],
                     help="设备摆放旋转角（默认 0，竖拿用 90 或 270）")
@@ -956,16 +1179,22 @@ def main():
                     help="压感曲线预设（默认 适中）")
     ap.add_argument("--smooth", default="轻", choices=[n for n, _ in SMOOTH_LEVELS],
                     help="笔迹平滑级别（默认 轻）")
+    ap.add_argument("--no-keep-awake", action="store_true",
+                    help="不在连接期间阻止设备息屏（默认阻止）")
     args = ap.parse_args()
 
-    serial = args.serial or find_device_serial()
+    try:
+        serial = args.serial or find_device_serial()
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
     if not serial:
         print("未发现 adb 设备，请先: adb connect <设备IP>:<端口>", file=sys.stderr)
         sys.exit(1)
     print(f"使用设备: {serial}")
 
     events: queue.Queue[PenEvent] = queue.Queue()
-    reader = PenReader(serial, events)
+    reader = PenReader(serial, events, keep_awake=not args.no_keep_awake)
     reader.start()
 
     smooth_idx = [n for n, _ in SMOOTH_LEVELS].index(args.smooth)

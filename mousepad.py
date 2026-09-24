@@ -35,7 +35,7 @@ from Quartz import (
 from Quartz.CoreGraphics import CGDisplayPixelsWide, CGDisplayPixelsHigh
 
 from main import (PEN_MAX_X, PEN_MAX_Y, PenEvent, PenReader,
-                  find_device_serial, no_device_dialog)
+                  find_device_serial, no_device_dialog, error_dialog)
 
 
 class MouseMapper:
@@ -114,7 +114,11 @@ class MouseMapper:
 def start_mousepad(serial: str | None = None, full_screen: bool = False,
                    rotation: int = 0):
     """带小状态窗口运行，供 CLI 和 .app 启动器共用。"""
-    serial = serial or find_device_serial()
+    try:
+        serial = serial or find_device_serial()
+    except FileNotFoundError as e:
+        error_dialog("缺少 adb", [str(e)])
+        sys.exit(1)
     while serial is None:
         if not no_device_dialog():
             sys.exit(0)
