@@ -358,7 +358,8 @@ class Whiteboard:
             "pingfangsc,hiraginosansgb", 13
         )
 
-        self.strokes: list[Stroke] = []
+        self.pages: list[list[Stroke]] = [[]]
+        self.page_idx = 0
         self.current: Stroke | None = None
         # 操作命令栈：每个操作记录 (操作前笔画表, 操作后笔画表)，对象共享，代价低
         self.history: list[tuple[list, list]] = []
@@ -378,6 +379,11 @@ class Whiteboard:
         restored = self.load_session()
         if restored:
             self.status = f"已恢复上次笔记（{restored} 笔）"
+
+    @property
+    def strokes(self) -> list[Stroke]:
+        """当前页的笔画表。"""
+        return self.pages[self.page_idx]
 
     # ---- 坐标与绘制 ----
 
@@ -590,7 +596,7 @@ class Whiteboard:
                 removed += 1
             else:
                 kept.append(s)
-        self.strokes = kept
+        self.pages[self.page_idx] = kept
         return removed
 
     def _erase_radius_screen(self) -> float:
@@ -651,33 +657,38 @@ class Whiteboard:
                             s.curve)
                 ns.points = run_pts
                 new_strokes.append(ns)
-        self.strokes = new_strokes
+        self.pages[self.page_idx] = new_strokes
         return split, gone
 
-    def _begin_op(self) -> list:
-        return list(self.strokes)
+    def _begin_op(self):
+        return (self.page_idx, list(self.pages[self.page_idx]))
 
-    def _end_op(self, before: list):
+    def _end_op(self, before):
+        pidx, before_list = before
         self.history = self.history[:self.h_idx]  # 丢弃被撤销分支
-        self.history.append((before, list(self.strokes)))
+        self.history.append((pidx, before_list, list(self.pages[pidx])))
         self.h_idx = len(self.history)
         self._dirty = True  # 会话待保存
 
     def undo(self):
         if self.h_idx > 0:
             self.h_idx -= 1
-            self.strokes = list(self.history[self.h_idx][0])
+            pidx, before, _ = self.history[self.h_idx]
+            self.pages[pidx] = list(before)
             self.redraw_all()
-            self.status = "已撤销"
+            self.status = "已撤销" + ("" if pidx == self.page_idx
+                                      else f"（第 {pidx + 1} 页）")
         else:
             self.status = "没有可撤销的操作"
 
     def redo(self):
         if self.h_idx < len(self.history):
-            self.strokes = list(self.history[self.h_idx][1])
+            pidx, _, after = self.history[self.h_idx]
+            self.pages[pidx] = list(after)
             self.h_idx += 1
             self.redraw_all()
-            self.status = "已重做"
+            self.status = "已重做" + ("" if pidx == self.page_idx
+                                      else f"（第 {pidx + 1} 页）")
         else:
             self.status = "没有可重做的操作"
 
@@ -698,10 +709,8 @@ class Whiteboard:
         return "适中"
 
     def save_session(self):
-        data = {
-            "version": 1,
-            "rotation": self.rotation,
-            "strokes": [
+        def page_data(page):
+            return [
                 {
                     "color": s.color_idx, "size": s.pen_size,
                     "min": s.min_mult, "max": s.max_mult,
@@ -710,8 +719,14 @@ class Whiteboard:
                                if self._curve_name_of(s) == "自定义" else None),
                     "points": s.points,
                 }
-                for s in self.strokes
-            ],
+                for s in page
+            ]
+
+        data = {
+            "version": 2,
+            "rotation": self.rotation,
+            "page": self.page_idx,
+            "pages": [page_data(p) for p in self.pages],
         }
         os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
         tmp = SESSION_FILE + ".tmp"
@@ -719,28 +734,37 @@ class Whiteboard:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, SESSION_FILE)
 
+    def _load_strokes(self, stroke_dicts) -> list[Stroke]:
+        loaded = []
+        for d in stroke_dicts:
+            if d.get("curve") == "自定义" and d.get("custom"):
+                self.custom_points = [tuple(p) for p in d["custom"]]
+                self.custom_curve = PressureCurve(self.custom_points)
+                curve = self.custom_curve
+            else:
+                curve = CURVES.get(d.get("curve", "适中"), CURVES["适中"])
+            s = Stroke(d["color"], d["size"], d["min"], d["max"], curve)
+            s.points = [tuple(p) for p in d["points"]]
+            loaded.append(s)
+        return loaded
+
     def load_session(self) -> int:
-        """启动时恢复上次会话。返回恢复的笔画数（无文件/损坏返回 0）。"""
+        """启动时恢复上次会话（多页）。返回总笔画数（无文件/损坏返回 0）。"""
         if not os.path.exists(SESSION_FILE):
             return 0
         try:
             with open(SESSION_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             self.rotation = int(data.get("rotation", 0))
-            loaded = []
-            for d in data.get("strokes", []):
-                if d.get("curve") == "自定义" and d.get("custom"):
-                    self.custom_points = [tuple(p) for p in d["custom"]]
-                    self.custom_curve = PressureCurve(self.custom_points)
-                    curve = self.custom_curve
-                else:
-                    curve = CURVES.get(d.get("curve", "适中"), CURVES["适中"])
-                s = Stroke(d["color"], d["size"], d["min"], d["max"], curve)
-                s.points = [tuple(p) for p in d["points"]]
-                loaded.append(s)
-            self.strokes = loaded
+            if data.get("version", 1) >= 2:
+                self.pages = [self._load_strokes(pd)
+                              for pd in data.get("pages", [])] or [[]]
+                self.page_idx = min(int(data.get("page", 0)),
+                                    len(self.pages) - 1)
+            else:  # 旧版单页格式
+                self.pages = [self._load_strokes(data.get("strokes", []))]
             self.redraw_all()
-            return len(loaded)
+            return sum(len(p) for p in self.pages)
         except Exception:  # noqa: BLE001
             return 0
 
@@ -818,6 +842,13 @@ class Whiteboard:
         eraser_label = "画笔" if self.erasing else "橡皮"
         r = pygame.Rect(x, y - 16, 52, 32)
         self.buttons.append((r, self._toggle_eraser, "text:" + eraser_label))
+        x += 62
+        for label, w, fn in (("◀", 36, lambda: self._switch_page(-1)),
+                             ("▶", 36, lambda: self._switch_page(1)),
+                             ("新页", 48, self._new_page)):
+            r = pygame.Rect(x, y - 16, w, 32)
+            self.buttons.append((r, fn, "text:" + label))
+            x += w + 8
 
     def _pick_color(self, i):
         self.color_idx = i
@@ -932,6 +963,38 @@ class Whiteboard:
             pygame.draw.circle(self.screen, color, (cx, cy), 6)
             pygame.draw.circle(self.screen, (255, 255, 255), (cx, cy), 3)
 
+    # ---- 多页 ----
+
+    def _commit_current(self):
+        """翻页/退出前把画到一半的笔画先收尾。"""
+        if self.current is not None:
+            if len(self.current.points) >= 1:
+                self._finish_stroke(self.current)
+            self.current = None
+            self.stab = []
+            self.prev_angle = None
+
+    def _switch_page(self, delta: int):
+        self._commit_current()
+        new = self.page_idx + delta
+        if new < 0:
+            return
+        if new >= len(self.pages):  # 末页再往后翻 = 追加新页
+            self.pages.append([])
+            new = len(self.pages) - 1
+            self.status = "新页"
+        else:
+            self.status = f"第 {new + 1}/{len(self.pages)} 页"
+        self.page_idx = new
+        self.redraw_all()
+
+    def _new_page(self):
+        self._commit_current()
+        self.pages.insert(self.page_idx + 1, [])
+        self.page_idx += 1
+        self.redraw_all()
+        self.status = f"新页（{self.page_idx + 1}/{len(self.pages)}）"
+
     def _clear(self):
         if not self.strokes:
             return
@@ -983,6 +1046,7 @@ class Whiteboard:
             for e in pygame.event.get():
                 self.last_activity = time.monotonic()
                 if e.type == pygame.QUIT:
+                    self._commit_current()
                     try:
                         self.save_session()
                     except Exception:  # noqa: BLE001
@@ -1016,6 +1080,12 @@ class Whiteboard:
                         self.save()
                     elif e.key == pygame.K_x:
                         self.export_svg()
+                    elif e.key in (pygame.K_RIGHT, pygame.K_PAGEDOWN):
+                        self._switch_page(1)
+                    elif e.key in (pygame.K_LEFT, pygame.K_PAGEUP):
+                        self._switch_page(-1)
+                    elif e.key == pygame.K_n:
+                        self._new_page()
                     elif e.key == pygame.K_e:
                         self._toggle_eraser()
                     elif e.key == pygame.K_r:
@@ -1063,6 +1133,7 @@ class Whiteboard:
 
             self.screen.blit(self.canvas, (0, 0))
             hud = (f"[{'●' if self.pen_down else '○'}] 压感 {self.show_pressure:4d} | "
+                   f"页 {self.page_idx + 1}/{len(self.pages)} | "
                    f"{self.rotation}° 曲线{self.curve_name} 平滑"
                    f"{SMOOTH_LEVELS[self.smooth_idx][0]} "
                    f"{self.min_mult:.2f}-{self.max_mult:.2f}x | {self.status}")
